@@ -166,7 +166,7 @@ def parse_opt():
     parser = argparse.ArgumentParser()
     parser.add_argument('--video_directory', type=str, default='survey_video', help='folder where videos to process exist')
     parser.add_argument('--model_weights_path', type=str, default='model_weights/exp1v8sbest.pt', help='path where YoloV8 model exists')
-    parser.add_argument('--altitude', type=int, default=30, help='survey flight altitude (meters)')
+    parser.add_argument('--altitude', type=int, default=40, help='survey flight altitude (meters)')
     parser.add_argument('--no_ui', action='store_true', help='Disable all UI elements during execution')
     parser.add_argument('--years', nargs='*', type=int, help='list of years to filter videos by')
     opt = parser.parse_args()
