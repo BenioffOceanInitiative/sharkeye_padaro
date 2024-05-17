@@ -21,24 +21,29 @@ def pixels_to_feet(altitude, pixel_size, original_frame_width):
     return size_m * 3.28084
 
 def get_grade_folder(confidence):
-    if confidence > 0.91:
+    if confidence > 0.90:
         return 'A_Grade'
-    elif confidence > 0.81:
+    elif confidence > 0.80:
         return 'B_Grade'
-    elif confidence > 0.71:
+    elif confidence > 0.70:
         return 'C_Grade'
-    elif confidence > 0.61:
+    elif confidence > 0.60:
         return 'D_Grade'
     else:
         return 'F_Grade'
     
-def save_detected_shark_frame(frame, frame_no_bb, frame_number, track_id, confidence, length, video_fps, video, csv_writer, survey_path, cap):
-    grade_folder = get_grade_folder(confidence)
-    save_path = os.path.join(survey_path, grade_folder)
-    os.makedirs(save_path, exist_ok=True)
-    video_name = os.path.basename(video).split(".")[0]
-    frame_bb_filename = os.path.join(save_path, f'{video_name}_shark_{track_id}.jpg')
-    frame_no_bb_filename =  os.path.join(save_path, f'{video_name}_shark_{track_id}_without_bb.jpg') 
+def save_detected_shark_frame(frame, frame_no_bb, frame_number, track_id, avg_conf, max_conf, min_conf, length, video_fps, video, csv_writer, survey_path, cap):
+    grade_folder = get_grade_folder(avg_conf)
+    bb_save_path = os.path.join(f'{survey_path}/bb', grade_folder)
+    no_bb_save_path = os.path.join(f'{survey_path}/no_bb', grade_folder)
+
+    os.makedirs(bb_save_path, exist_ok=True)
+    os.makedirs(no_bb_save_path, exist_ok=True)
+
+    video_file = os.path.basename(video)
+    video_name = video_file.split(".")[0]
+    frame_bb_filename = os.path.join(bb_save_path, f'{video_name}_shark_{track_id}.jpg')
+    frame_no_bb_filename =  os.path.join(no_bb_save_path, f'{video_name}_shark_{track_id}.jpg') 
     
     cv2.imwrite(frame_bb_filename, frame)
     cv2.imwrite(frame_no_bb_filename, frame_no_bb)
@@ -46,12 +51,10 @@ def save_detected_shark_frame(frame, frame_no_bb, frame_number, track_id, confid
     seconds = frame_number / video_fps
     timestamp = seconds_to_minutes_and_seconds(seconds)
     
-    print(f'frame number: {frame_number}, video_fps: {video_fps}, timestamp: {timestamp}')
+    csv_writer.writerow([video_file, track_id, frame_number, timestamp, avg_conf, max_conf, min_conf, grade_folder.split('_')[0], length])
+    print(f"Saved frame for shark {track_id} with confidence {avg_conf:.2f} to {grade_folder} at {timestamp}")
 
-    csv_writer.writerow([video, track_id, frame_number, timestamp, confidence, grade_folder.split('_')[0], length])
-    print(f"Saved frame for shark {track_id} with confidence {confidence:.2f} to {grade_folder} at {timestamp}")
-
-def run_inference(video_directory='survey_video', model_weights_path='model_weights/exp1v8sbest.pt', altitude=30, no_ui=False, years=None):
+def run_inference(video_directory='survey_video', model_weights_path='model_weights/exp1v8sbest.pt', altitude=30, show_ui=False, years=None):
     model = YOLO(model_weights_path)
 
     device = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
@@ -76,7 +79,7 @@ def run_inference(video_directory='survey_video', model_weights_path='model_weig
     
     csv_file = open(f'{survey_path}/shark_detections_{survey_datetime}.csv', mode='w', newline='')
     csv_writer = csv.writer(csv_file)
-    csv_writer.writerow(['Video', 'Track ID', 'Frame Number', 'Timestamp', 'Confidence', 'Grade', 'Length'])
+    csv_writer.writerow(['Video', 'Track ID', 'Frame Number', 'Timestamp', 'Average Confidence', 'Max Confidence', 'Min Confidence', 'Grade', 'Length'])
     
     for video in videos:
         tracked_sharks = defaultdict(lambda: {"positions": [], "count": 0, "confidences": [], "lengths": [], "frame_number": None, "frame": {}, "frame_no_bb": {}})
@@ -104,7 +107,7 @@ def run_inference(video_directory='survey_video', model_weights_path='model_weig
                 resized_frame = cv2.resize(frame, (1280, 720))
 
                 # Run YOLOv8 tracking on the frame, persisting tracks between frames
-                results = model.track(resized_frame, persist=True, conf=0.5, device=device, iou=0.25, verbose=False, show=not no_ui)
+                results = model.track(resized_frame, persist=True, conf=0.5, device=device, iou=0.25, verbose=False, show=show_ui)
 
                 # Get the boxes and track IDs
                 boxes = results[0].boxes.xywh.cpu().tolist()
@@ -138,7 +141,7 @@ def run_inference(video_directory='survey_video', model_weights_path='model_weig
                         track_data["positions"].pop(0)
 
                 # Display the annotated frame
-                if not no_ui:
+                if show_ui:
                     cv2.imshow("YOLOv8 Tracking", annotated_frame)
 
                 # Break the loop if 'q' is pressed
@@ -154,8 +157,10 @@ def run_inference(video_directory='survey_video', model_weights_path='model_weig
                 frame = track_data["frame"][middle_frame_number]
                 frame_no_bb = track_data["frame_no_bb"][middle_frame_number]
                 avg_confidence = np.mean(track_data["confidences"])
+                max_conf = np.max(track_data["confidences"])
+                min_conf = np.min(track_data["confidences"])
                 avg_length = np.mean(track_data["lengths"])
-                save_detected_shark_frame(frame, frame_no_bb, middle_frame_number, track_id, avg_confidence, avg_length, video_fps, video, csv_writer, survey_path, cap)
+                save_detected_shark_frame(frame, frame_no_bb, middle_frame_number, track_id, avg_confidence, max_conf, min_conf, avg_length, video_fps, video, csv_writer, survey_path, cap)
         
         cv2.destroyAllWindows()
         cap.release()
@@ -167,7 +172,7 @@ def parse_opt():
     parser.add_argument('--video_directory', type=str, default='survey_video', help='folder where videos to process exist')
     parser.add_argument('--model_weights_path', type=str, default='model_weights/exp1v8sbest.pt', help='path where YoloV8 model exists')
     parser.add_argument('--altitude', type=int, default=40, help='survey flight altitude (meters)')
-    parser.add_argument('--no_ui', action='store_true', help='Disable all UI elements during execution')
+    parser.add_argument('--show_ui', action='store_true', help='Disable all UI elements during execution')
     parser.add_argument('--years', nargs='*', type=int, help='list of years to filter videos by')
     opt = parser.parse_args()
     return opt
