@@ -1,141 +1,179 @@
 import cv2
 import os
 import argparse
-
-
+import torch
 from ultralytics import YOLO
-
-from video_processing import ar_resize
-from tracker_logic import Track, SharkTracker
-from output import output, draw_bounding_box
-
+from collections import defaultdict
+import numpy as np
+from datetime import datetime
+import csv
+import math
 
 #helper function for timestamping - in progress not working properly
 def seconds_to_minutes_and_seconds(seconds):
     minutes, seconds = divmod(seconds, 60)
-    return str(minutes) + ':' + str(round(seconds)) 
+    return f"{int(minutes):02d}:{int(seconds):02d}" 
 
+def pixels_to_feet(altitude, pixel_size, original_frame_width):
+    aspect_ratio = 1.7777777777
+    fov = (altitude * aspect_ratio * 2 * math.tan(math.radians(73) / 2)) / (np.sqrt(1 + aspect_ratio ** 2))
+    size_m = pixel_size / original_frame_width * fov
+    return size_m * 3.28084
 
-# gpu = True if Apple mps is available
-# imgsz = desired pixel width for inference
-# video_dir = directory of videos to run inference on
-# altitude = set target altitude of transect, default = 30
-def run_inference(gpu=False, imgsz=720, video_dir='survey_video', altitude=30):
+def get_grade_folder(confidence):
+    if confidence > 0.91:
+        return 'A_Grade'
+    elif confidence > 0.81:
+        return 'B_Grade'
+    elif confidence > 0.71:
+        return 'C_Grade'
+    elif confidence > 0.61:
+        return 'D_Grade'
+    else:
+        return 'F_Grade'
+    
+def save_detected_shark_frame(frame, frame_no_bb, frame_number, track_id, confidence, length, video_fps, video, csv_writer, survey_path, cap):
+    grade_folder = get_grade_folder(confidence)
+    save_path = os.path.join(survey_path, grade_folder)
+    os.makedirs(save_path, exist_ok=True)
+    video_name = os.path.basename(video).split(".")[0]
+    frame_bb_filename = os.path.join(save_path, f'{video_name}_shark_{track_id}.jpg')
+    frame_no_bb_filename =  os.path.join(save_path, f'{video_name}_shark_{track_id}_without_bb.jpg') 
+    
+    cv2.imwrite(frame_bb_filename, frame)
+    cv2.imwrite(frame_no_bb_filename, frame_no_bb)
+    
+    seconds = frame_number / video_fps
+    timestamp = seconds_to_minutes_and_seconds(seconds)
+    
+    print(f'frame number: {frame_number}, video_fps: {video_fps}, timestamp: {timestamp}')
 
-    #load the model with the weights located at weights path
-    weights_path = 'model_weights/exp1v8sbest.pt'
-    model = YOLO(weights_path)
+    csv_writer.writerow([video, track_id, frame_number, timestamp, confidence, grade_folder.split('_')[0], length])
+    print(f"Saved frame for shark {track_id} with confidence {confidence:.2f} to {grade_folder} at {timestamp}")
 
-    #assign desired frame rate for inference based on the availability of Apple mps gpu, we will sample our 
-    # survey videos at the desired frame rate before running inference on them
-    if gpu:
-        desired_frame_rate = 8
-    elif not gpu:
-        desired_frame_rate = 4
+def run_inference(video_directory='survey_video', model_weights_path='model_weights/exp1v8sbest.pt', altitude=30, no_ui=False, years=None):
+    model = YOLO(model_weights_path)
 
-    # make function to concatenate videos if needed here
+    device = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
+    desired_frame_rate = 8 if device != 'cpu' else 4
+    
+    model.to(device=device)
+    print(f'Using {device} for inference.')
 
-    #list of full file paths to videos for each video in video_dir which in default is survey_video
-    videos = [os.path.join(video_dir, file) for file in os.listdir(video_dir) if not file.startswith('.')]
+    if years:
+        years = set(map(str, years))
+    
+    videos = [os.path.join(video_directory, file) for file in os.listdir(video_directory) if not file.startswith('.') and (not years or any(year in file for year in years))]
 
-    #initiate list to save all high confidence sharks 
-    final_shark_list = []
-    #initiate list to save all low confidence tracked objects
-    final_low_conf_tracks_list = []
+    results_path = os.path.join(os.getcwd(), 'results')
+    if not os.path.exists(results_path):
+        os.makedirs(results_path)
 
-    #iterate through each video in the videos list
+    survey_datetime = datetime.now().strftime("%Y%m%d_%H%M%S")
+    survey_folder = f'survey_{survey_datetime}'
+    survey_path = os.path.join(results_path, survey_folder)
+    os.makedirs(survey_path, exist_ok=True)
+    
+    csv_file = open(f'{survey_path}/shark_detections_{survey_datetime}.csv', mode='w', newline='')
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(['Video', 'Track ID', 'Frame Number', 'Timestamp', 'Confidence', 'Grade', 'Length'])
+    
     for video in videos:
+        tracked_sharks = defaultdict(lambda: {"positions": [], "count": 0, "confidences": [], "lengths": [], "frame_number": None, "frame": {}, "frame_no_bb": {}})
+
+        print(f'Processing {video.split("/")[-1]}')
         cap = cv2.VideoCapture(video)
-
-        original_frame_width = cap.get(3)
-        original_frame_height = cap.get(4)
-
-        # given the original frame width and height and desired pixel width, return the desired [pixel_height, pixel_width] 
-        # to resize images to before running inference that maintains the original aspect ratio
-        resize_img_w_and_h = ar_resize(original_frame_width, original_frame_height, imgsz)
+        if not cap.isOpened():
+            print(f'Error opening {video} file')
+            continue
         
-        # get original frame rate
-        original_fps = cap.get(cv2.CAP_PROP_FPS)
-        # get rate at which to sample survey_video
-        frame_sample_rate = round(original_fps/desired_frame_rate)
+        video_fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_rate_sample = round(video_fps/desired_frame_rate)
+        original_frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        
+        frame_number = 1
 
-        #initiate tracker object 
-        st = SharkTracker(altitude, desired_frame_rate)
-
-        frame_no = 0
-
-        #iterate over each frame in video
         while cap.isOpened():
-            success = cap.grab()
+            # Read a frame from the video
+            success, frame = cap.read()
+            
+            if not success:
+                break;
 
-            #reducing video frame rate here
-            if success and frame_no % frame_sample_rate == 0:
-                _, frame = cap.retrieve()
+            if (frame_number % frame_rate_sample) == 0:
+                resized_frame = cv2.resize(frame, (1280, 720))
 
-                # running inference here, results[0] has attributes boxes, id, conf, which are lists 
-                # containing the ids, bounding boxes, and confidence  information about each detection in frame
+                # Run YOLOv8 tracking on the frame, persisting tracks between frames
+                results = model.track(resized_frame, persist=True, conf=0.5, device=device, iou=0.25, verbose=False, show=not no_ui)
 
-                # note: frame rate should relate to how we set iou
-                # conf = min confidence to make a detection
-                if gpu:
-                    results = model.track(frame, conf=.41, device='mps', imgsz=resize_img_w_and_h, iou=0.39, show=True, verbose=False, persist=True)
-                elif not gpu:
-                    results = model.track(frame, conf=.41, imgsz=resize_img_w_and_h, iou=0.39, show=True, verbose=False, persist=True)
-                
-                # Get the boxes ,classes and track IDs of frame
+                # Get the boxes and track IDs
                 boxes = results[0].boxes.xywh.cpu().tolist()
-                confidence = results[0].boxes.conf.cpu().tolist() 
-                track_ids = results[0].boxes.id
-                # handles a yolo empty list error
-                if track_ids == None:
-                    track_ids = []
-                else:
-                    track_ids= track_ids.cpu().tolist()
-                    
-                timestamp = 'na'
+                confidences = results[0].boxes.conf.cpu().tolist()
+                track_ids = results[0].boxes.id.cpu().tolist() if results[0].boxes.id is not None else []
 
-                detections_list = zip(track_ids, boxes, confidence)
+                # Visualize the results on the frame
+                annotated_frame = results[0].plot()
 
-                #update tracker with detections from frame, returns an appended list of all tracked items
-                all_tracks = st.update_tracker(detections_list, frame, original_frame_width, timestamp)
+                for box, track_id, confidence in zip(boxes, track_ids, confidences):
+                    x, y, w, h = box
+                    if track_id not in tracked_sharks:
+                        tracked_sharks[track_id] = {"positions": [], "count": 0, "confidences": [], "lengths": [], "frame": {}, "frame_no_bb": {}}
+                    track_data = tracked_sharks[track_id]
+                    track_data["positions"].append((float(x), float(y)))
+                    track_data["count"] += 1
+                    track_data["confidences"].append(confidence)
+                    track_data["frame_number"] = frame_number
+                    track_data["frame"][frame_number] = annotated_frame.copy()
+                    track_data["frame_no_bb"][frame_number] = resized_frame.copy()
 
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    long_side = max(w, h)
+                    short_side = min(w, h)
+                    if short_side / long_side >= 0.57:
+                        length = pixels_to_feet(altitude, (short_side**2 + long_side**2)**0.5, original_frame_width)
+                    else:
+                        length = pixels_to_feet(altitude, long_side, original_frame_width)
+                    track_data["lengths"].append(length)
+
+                    if len(track_data["positions"]) > 30:  # retain 30 tracks for 30 frames
+                        track_data["positions"].pop(0)
+
+                # Display the annotated frame
+                if not no_ui:
+                    cv2.imshow("YOLOv8 Tracking", annotated_frame)
+
+                # Break the loop if 'q' is pressed
+                if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
             
-            # exits the loop if the video is over
-            elif not success:
-                break
-
-            frame_no += 1
+            frame_number += 1
+            
+        for track_id, track_data in tracked_sharks.items():
+            if track_data["count"] > 3:
+                frame_numbers = sorted(track_data["frame"].keys())
+                middle_frame_number = frame_numbers[len(frame_numbers) // 2]
+                frame = track_data["frame"][middle_frame_number]
+                frame_no_bb = track_data["frame_no_bb"][middle_frame_number]
+                avg_confidence = np.mean(track_data["confidences"])
+                avg_length = np.mean(track_data["lengths"])
+                save_detected_shark_frame(frame, frame_no_bb, middle_frame_number, track_id, avg_confidence, avg_length, video_fps, video, csv_writer, survey_path, cap)
         
-
-
-        for trk in all_tracks:
-            if trk.confirmed:
-                final_shark_list.append(trk)
-            else:
-                final_low_conf_tracks_list.append(trk)
-
-
-    # save ann info
-    output(final_shark_list, final_low_conf_tracks_list)
-
-
-    #return final shark list
-
+        cv2.destroyAllWindows()
+        cap.release()
+    
+    csv_file.close()
 
 def parse_opt():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--gpu', action =argparse.BooleanOptionalAction, help='True or False this is a Macbook with an m1, m2, or m3 chip')
-    parser.add_argument('--imgsz', type=int, default=720, help='image height for inference (pixels)')
-    parser.add_argument('--video_dir', type=str, default='survey_video', help='folder where videos to process exist')
+    parser.add_argument('--video_directory', type=str, default='survey_video', help='folder where videos to process exist')
+    parser.add_argument('--model_weights_path', type=str, default='model_weights/exp1v8sbest.pt', help='path where YoloV8 model exists')
     parser.add_argument('--altitude', type=int, default=30, help='survey flight altitude (meters)')
+    parser.add_argument('--no_ui', action='store_true', help='Disable all UI elements during execution')
+    parser.add_argument('--years', nargs='*', type=int, help='list of years to filter videos by')
     opt = parser.parse_args()
     return opt
 
 def main(opt):
     run_inference(**vars(opt))
-
 
 if __name__=='__main__':
     opt = parse_opt()    
