@@ -55,12 +55,10 @@ def save_detected_shark_frame(frame, frame_no_bb, frame_number, track_id, avg_co
     print(f"Saved frame for shark {track_id} with confidence {avg_conf:.2f} to {grade_folder} at {timestamp}")
 
 def run_inference(video_directory='survey_video', model_weights_path='model_weights/exp1v8sbest.pt', altitude=30, show_ui=False, years=None):
-    model = YOLO(model_weights_path)
 
     device = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
     desired_frame_rate = 8 if device != 'cpu' else 4
     
-    model.to(device=device)
     print(f'Using {device} for inference.')
 
     if years:
@@ -82,6 +80,8 @@ def run_inference(video_directory='survey_video', model_weights_path='model_weig
     csv_writer.writerow(['Video', 'Track ID', 'Frame Number', 'Timestamp', 'Average Confidence', 'Max Confidence', 'Min Confidence', 'Grade', 'Length'])
     
     for video in videos:
+        model = YOLO(model_weights_path).to(device=device)
+
         tracked_sharks = defaultdict(lambda: {"positions": [], "count": 0, "confidences": [], "lengths": [], "frame_number": None, "frame": {}, "frame_no_bb": {}})
 
         print(f'Processing {video.split("/")[-1]}')
@@ -105,9 +105,9 @@ def run_inference(video_directory='survey_video', model_weights_path='model_weig
 
             if (frame_number % frame_rate_sample) == 0:
                 resized_frame = cv2.resize(frame, (1280, 720))
-
+                model_frame = resized_frame.copy()
                 # Run YOLOv8 tracking on the frame, persisting tracks between frames
-                results = model.track(resized_frame, persist=True, conf=0.5, device=device, iou=0.25, verbose=False, show=show_ui)
+                results = model.track(model_frame, persist=True, conf=0.5, device=device, iou=0.25, verbose=False, show=show_ui)
 
                 # Get the boxes and track IDs
                 boxes = results[0].boxes.xywh.cpu().tolist()
@@ -127,7 +127,7 @@ def run_inference(video_directory='survey_video', model_weights_path='model_weig
                     track_data["confidences"].append(confidence)
                     track_data["frame_number"] = frame_number
                     track_data["frame"][frame_number] = annotated_frame.copy()
-                    track_data["frame_no_bb"][frame_number] = resized_frame.copy()
+                    track_data["frame_no_bb"][frame_number] = model_frame
 
                     long_side = max(w, h)
                     short_side = min(w, h)
