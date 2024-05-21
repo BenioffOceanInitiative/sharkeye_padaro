@@ -80,7 +80,7 @@ def run_inference(video_directory='survey_video', model_weights_path='model_weig
         model = YOLO(model_weights_path).to(device=device)
 
         for video in videos:
-            tracked_sharks = defaultdict(lambda: {"positions": [], "count": 0, "confidences": [], "lengths": [], "frame_number": None, "frame": None, "frame_no_bb": None})
+            tracked_sharks = defaultdict(lambda: {"positions": [], "count": 0, "confidences": [], "lengths": [], "frame_number": None, "frame": [], "frame_no_bb": []})
 
             print(f'Processing {os.path.basename(video)}')
             cap = cv2.VideoCapture(video)
@@ -100,8 +100,8 @@ def run_inference(video_directory='survey_video', model_weights_path='model_weig
                     break
 
                 if (frame_number % frame_rate_sample) == 0:
-                    resized_frame = cv2.resize(frame, (1280, 720))
-                    results = model.track(resized_frame, conf=0.5, device=device, iou=0.25, verbose=False, show=show_ui, tracker='bytetrack.yaml')
+                    # resized_frame = cv2.resize(frame, (1280, 720))
+                    results = model.track(frame, conf=0.3, device=device, iou=0.25, verbose=False, show=show_ui)
                     
                     boxes = results[0].boxes.xywh.cpu().tolist()
                     confidences = results[0].boxes.conf.cpu().tolist()
@@ -116,8 +116,8 @@ def run_inference(video_directory='survey_video', model_weights_path='model_weig
                         track_data["count"] += 1
                         track_data["confidences"].append(confidence)
                         track_data["frame_number"] = frame_number
-                        track_data["frame"] = annotated_frame.copy()
-                        track_data["frame_no_bb"] = resized_frame.copy()
+                        track_data["frame"].append(annotated_frame.copy())
+                        track_data["frame_no_bb"].append(frame)
 
                         long_side = max(w, h)
                         short_side = min(w, h)
@@ -138,7 +138,8 @@ def run_inference(video_directory='survey_video', model_weights_path='model_weig
                     max_conf = np.max(track_data["confidences"])
                     min_conf = np.min(track_data["confidences"])
                     avg_length = np.mean(track_data["lengths"])
-                    save_detected_shark_frame(track_data["frame"], track_data["frame_no_bb"], track_data["frame_number"], track_id, avg_confidence, max_conf, min_conf, avg_length, video_fps, video, csv_writer, survey_path)
+                    index_of_max_conf = track_data["confidences"].index(max(track_data["confidences"]))
+                    save_detected_shark_frame(track_data["frame"][index_of_max_conf], track_data["frame_no_bb"][index_of_max_conf], track_data["frame_number"], track_id, avg_confidence, max_conf, min_conf, avg_length, video_fps, video, csv_writer, survey_path)
                 
             cv2.destroyAllWindows()
             cap.release()
