@@ -80,7 +80,7 @@ def run_inference(video_directory='survey_video', model_weights_path='model_weig
         model = YOLO(model_weights_path).to(device=device)
 
         for video in videos:
-            tracked_sharks = defaultdict(lambda: {"positions": [], "count": 0, "confidences": [], "lengths": [], "frame_number": None, "frame": [], "frame_no_bb": []})
+            tracked_sharks = defaultdict(lambda: {"positions": [], "count": 0, "confidences": [], "length": None, "frame_number": None, "frame": [], "frame_no_bb": []})
 
             print(f'Processing {os.path.basename(video)}')
             cap = cv2.VideoCapture(video)
@@ -98,17 +98,21 @@ def run_inference(video_directory='survey_video', model_weights_path='model_weig
                 
                 if not success:
                     break
-
+                
                 if (frame_number % frame_rate_sample) == 0:
-                    # resized_frame = cv2.resize(frame, (1280, 720))
-                    results = model.track(frame, conf=0.3, device=device, iou=0.25, verbose=False, show=show_ui)
+                    resized_frame = cv2.resize(frame, (1280, 720))
+                    results = model.track(resized_frame, conf=0.4, device=device, iou=0.25, verbose=False, show=show_ui, persist=True)
                     
+                    del resized_frame
                     boxes = results[0].boxes.xywh.cpu().tolist()
                     confidences = results[0].boxes.conf.cpu().tolist()
                     track_ids = results[0].boxes.id.cpu().tolist() if results[0].boxes.id is not None else []
+                                    
+                    if not track_ids:
+                        continue
                     
                     annotated_frame = results[0].plot()
-
+                    
                     for box, track_id, confidence in zip(boxes, track_ids, confidences):
                         x, y, w, h = box
                         track_data = tracked_sharks[track_id]
@@ -125,7 +129,8 @@ def run_inference(video_directory='survey_video', model_weights_path='model_weig
                             length = pixels_to_feet(altitude, (short_side**2 + long_side**2)**0.5, original_frame_width)
                         else:
                             length = pixels_to_feet(altitude, long_side, original_frame_width)
-                        track_data["lengths"].append(length)
+                            
+                        track_data["length"] = max(length, track_data["length"]) if track_data["length"] else length
 
                     if cv2.waitKey(1) & 0xFF == ord("q"):
                         break
@@ -137,10 +142,9 @@ def run_inference(video_directory='survey_video', model_weights_path='model_weig
                     avg_confidence = np.mean(track_data["confidences"])
                     max_conf = np.max(track_data["confidences"])
                     min_conf = np.min(track_data["confidences"])
-                    avg_length = np.mean(track_data["lengths"])
                     index_of_max_conf = track_data["confidences"].index(max(track_data["confidences"]))
-                    save_detected_shark_frame(track_data["frame"][index_of_max_conf], track_data["frame_no_bb"][index_of_max_conf], track_data["frame_number"], track_id, avg_confidence, max_conf, min_conf, avg_length, video_fps, video, csv_writer, survey_path)
-                
+                    save_detected_shark_frame(track_data["frame"][index_of_max_conf], track_data["frame_no_bb"][index_of_max_conf], track_data["frame_number"], track_id, avg_confidence, max_conf, min_conf, track_data["length"], video_fps, video, csv_writer, survey_path)
+
             cv2.destroyAllWindows()
             cap.release()
             tracked_sharks.clear()
